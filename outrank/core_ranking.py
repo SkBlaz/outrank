@@ -11,16 +11,17 @@ from collections import defaultdict
 from collections import deque
 from timeit import default_timer as timer
 from typing import Any
-from typing import Dict
-from typing import List
-from typing import Set
-from typing import Tuple
-from typing import Union
 
 import numpy as np
 import pandas as pd
 import tqdm
+import xxhash
+import zstandard as zstd
 
+from outrank.algorithms.importance_estimator import \
+    compute_interaction_information_for_pairs
+from outrank.algorithms.importance_estimator import \
+    get_importances_estimate_nonmyopic
 from outrank.algorithms.importance_estimator import \
     get_importances_estimate_pairwise
 from outrank.algorithms.sketches.counting_counters_ordinary import \
@@ -33,6 +34,7 @@ from outrank.core_utils import generic_line_parser
 from outrank.core_utils import get_num_of_instances
 from outrank.core_utils import internal_hash
 from outrank.core_utils import is_prior_heuristic
+from outrank.core_utils import MinibatchResult
 from outrank.core_utils import NominalFeatureSummary
 from outrank.core_utils import NumericFeatureSummary
 from outrank.feature_transformations.ranking_transformers import FeatureTransformerGeneric
@@ -56,10 +58,9 @@ def prior_combinations_sample(combinations: list[tuple[Any, ...]], args: Any) ->
     if len(combinations) == 0:
         return []
 
-    missing_combinations = set(set(combinations)).difference(GLOBAL_PRIOR_COMB_COUNTS.keys())
-    if len(missing_combinations) > 0:
-        for combination in missing_combinations:
-            GLOBAL_PRIOR_COMB_COUNTS[combination] = 0
+    missing_combinations = set(combinations).difference(GLOBAL_PRIOR_COMB_COUNTS.keys())
+    for combination in missing_combinations:
+        GLOBAL_PRIOR_COMB_COUNTS[combination] = 0
 
     tmp = sorted(combinations, key=GLOBAL_PRIOR_COMB_COUNTS.get, reverse=False)[:args.combination_number_upper_bound]
 
@@ -109,13 +110,15 @@ def mixed_rank_graph(
     all_columns = input_dataframe.columns
 
     triplets = []
-    tmp_df = input_dataframe.copy().astype('category')
     out_time_struct = {}
 
     # Handle cont. types prior to interaction evaluation
     pbar.set_description('Encoding columns')
     start_enc_timer = timer()
-    tmp_df = pd.DataFrame({k : tmp_df[k].cat.codes for k in all_columns})
+    # pd.factorize is single-pass per column, avoids full .copy().astype('category')
+    tmp_df = pd.DataFrame(
+        {k: pd.factorize(input_dataframe[k])[0].astype(np.int32) for k in all_columns},
+    )
 
     end_enc_timer = timer()
     out_time_struct['encoding_columns'] = end_enc_timer - start_enc_timer
@@ -142,9 +145,14 @@ def mixed_rank_graph(
     # Map the scoring calls to the worker pool
     pbar.set_description('Allocating thread pool')
 
-    # starmap is an alternative that is slower unfortunately (but nicer)
+    # Pre-extract column arrays to avoid pickling the full DataFrame per worker.
+    # For reference_model heuristics we still need the DataFrame for multi-column access.
+    _col_arrays = {col: np.ascontiguousarray(tmp_df[col].values, dtype=np.int32) for col in tmp_df.columns}
+    _needs_df = bool(args.reference_model_JSON) or args.heuristic in {'surrogate-SGD', 'surrogate-SVM', 'surrogate-SGD-RP', 'surrogate-SGD-SVD'}
+    _tmp_df_for_workers = tmp_df if _needs_df else None
+
     def get_grounded_importances_estimate(combination: tuple[str]) -> Any:
-        return get_importances_estimate_pairwise(combination, reference_model_features, args, tmp_df=tmp_df)
+        return get_importances_estimate_pairwise(combination, reference_model_features, args, tmp_df=_tmp_df_for_workers, col_arrays=_col_arrays)
 
     start_enc_timer = timer()
     with cpu_pool as p:
@@ -164,10 +172,31 @@ def mixed_rank_graph(
         inv = (triplet[1], triplet[0], triplet[2])
         final_triplets.append(inv)
         final_triplets.append(triplet)
-        triplets = final_triplets
+
+    # Optional JMI and interaction information (gated by CLI flags, default off)
+    jmi_ranking = None
+    interaction_info = None
+    pairwise_mi_dict = None
+
+    if getattr(args, 'compute_jmi', 'False') == 'True' or getattr(args, 'compute_interaction_info', 'False') == 'True':
+        pairwise_mi_dict = {(t[0], t[1]): t[2] for t in triplets}
+
+    if getattr(args, 'compute_jmi', 'False') == 'True':
+        pbar.set_description('Computing JMI ranking')
+        jmi_ranking = get_importances_estimate_nonmyopic(
+            args, tmp_df, pairwise_mi_dict=pairwise_mi_dict,
+            top_k=int(getattr(args, 'jmi_top_k', 50)),
+        )
+
+    if getattr(args, 'compute_interaction_info', 'False') == 'True':
+        pbar.set_description('Computing interaction information')
+        interaction_info = compute_interaction_information_for_pairs(
+            tmp_df, args, pairwise_mi_dict,
+            top_k=int(getattr(args, 'interaction_info_top_k', 30)),
+        )
 
     pbar.set_description('Proceeding to the next batch of data')
-    return BatchRankingSummary(triplets, out_time_struct)
+    return BatchRankingSummary(final_triplets, out_time_struct, jmi_ranking, interaction_info)
 
 
 def enrich_with_transformations(
@@ -200,18 +229,16 @@ def compute_combined_features(
     join_string = ' AND_REL ' if is_3mr else ' AND '
     interaction_order = 2 if is_3mr else args.interaction_order
 
-    model_combinations = []
     full_combination_space = []
 
-
     if args.interaction_order > 1:
-            full_combination_space = list(
-                itertools.combinations(all_columns, interaction_order),
-            )
+        full_combination_space = list(
+            itertools.combinations(all_columns, interaction_order),
+        )
     full_combination_space = prior_combinations_sample(full_combination_space, args)
 
     if args.reference_model_JSON != '':
-        model_combinations = extract_features_from_reference_JSON(args.reference_model_JSON, combined_features_only = True)
+        model_combinations = extract_features_from_reference_JSON(args.reference_model_JSON, combined_features_only=True)
         model_combinations = [tuple(sorted(combination.split(','))) for combination in model_combinations]
         if not is_prior_heuristic(args):
             full_combination_space = model_combinations
@@ -219,25 +246,20 @@ def compute_combined_features(
     if is_prior_heuristic(args):
         full_combination_space = full_combination_space + [tuple for tuple in model_combinations if tuple not in full_combination_space]
 
+    def combine_features(new_combination):
+        combined_feature = input_dataframe[new_combination[0]].astype(str)
+        for feature in new_combination[1:]:
+            combined_feature += input_dataframe[feature].astype(str)
+        combined_feature = combined_feature.apply(lambda x: xxhash.xxh64(x).hexdigest())
+        ftr_name = join_string.join(new_combination)
+        return ftr_name, combined_feature
 
-    com_counter = 0
     new_feature_hash = {}
-    for new_combination in full_combination_space:
-        pbar.set_description(
-            f'Created {com_counter}/{len(full_combination_space)}',
-        )
-        combined_feature: list[str] = [str(0)] * input_dataframe.shape[0]
-        for feature in new_combination:
-            tmp_feature = input_dataframe[feature].tolist()
-            for enx, el in enumerate(tmp_feature):
-                combined_feature[enx] = str(
-                    internal_hash(
-                        str(combined_feature[enx]) + str(el),
-                    ),
-                )
-        ftr_name = join_string.join(str(x) for x in new_combination)
+    for idx, new_combination in enumerate(full_combination_space):
+        pbar.set_description(f'Created {idx + 1}/{len(full_combination_space)}')
+        ftr_name, combined_feature = combine_features(new_combination)
         new_feature_hash[ftr_name] = combined_feature
-        com_counter += 1
+
     tmp_df = pd.DataFrame(new_feature_hash)
     pbar.set_description('Concatenating into final frame ..')
     input_dataframe = pd.concat([input_dataframe, tmp_df], axis=1)
@@ -388,17 +410,12 @@ def compute_coverage(input_dataframe: pd.DataFrame, args: Any) -> dict[str, set[
     """Compute coverage of features, incrementally"""
     output_storage_cov = defaultdict(set)
     all_missing_symbols = set(args.missing_value_symbols.split(','))
+    n_rows = input_dataframe.shape[0]
+    missing_arr = np.array(list(all_missing_symbols))
     for column in input_dataframe:
-        all_missing = sum(
-            [
-                input_dataframe[column].values.tolist().count(x)
-                for x in all_missing_symbols
-            ],
-        )
-
-        output_storage_cov[column] = (
-            1 - (all_missing / input_dataframe.shape[0])
-        ) * 100
+        col_vals = input_dataframe[column].values
+        all_missing = np.isin(col_vals, missing_arr).sum()
+        output_storage_cov[column] = (1 - (all_missing / n_rows)) * 100
 
     return output_storage_cov
 
@@ -406,15 +423,9 @@ def compute_coverage(input_dataframe: pd.DataFrame, args: Any) -> dict[str, set[
 def compute_feature_memory_consumption(input_dataframe: pd.DataFrame, args: Any) -> dict[str, set[str]]:
     """An approximation of how much feature take up"""
     output_storage_features = defaultdict(set)
+    n_rows = input_dataframe.shape[0]
     for col in input_dataframe.columns:
-        specific_column = [
-            str(x).strip() for x in input_dataframe[col].astype(str).values.tolist()
-        ]
-        col_size = sum(
-            len(x.encode())
-            for x in specific_column
-        ) / input_dataframe.shape[0]
-        output_storage_features[col] = col_size
+        output_storage_features[col] = input_dataframe[col].astype(str).str.len().sum() / n_rows
     return output_storage_features
 
 
@@ -424,76 +435,78 @@ def compute_value_counts(input_dataframe: pd.DataFrame, args: Any):
     global GLOBAL_RARE_VALUE_STORAGE
     global IGNORED_VALUES
 
+    ignored_values = IGNORED_VALUES
+    global_storage = GLOBAL_RARE_VALUE_STORAGE
+    rare_value_count_upper_bound = args.rare_value_count_upper_bound
+
     for column in input_dataframe.columns:
-        main_values = input_dataframe[column].values
-        for value in main_values:
-            if value not in IGNORED_VALUES:
-                GLOBAL_RARE_VALUE_STORAGE.update({(column, value): 1})
+        col_counts = Counter(input_dataframe[column].values.tolist())
+        for value, cnt in col_counts.items():
+            key = (column, value)
+            if key not in ignored_values:
+                global_storage[key] += cnt
 
-    for key, val in GLOBAL_RARE_VALUE_STORAGE.items():
-        if val > args.rare_value_count_upper_bound:
-            IGNORED_VALUES.add(key)
+    keys_to_remove = []
+    for key, val in global_storage.items():
+        if val > rare_value_count_upper_bound:
+            ignored_values.add(key)
+            keys_to_remove.append(key)
 
-    for to_remove_val in IGNORED_VALUES:
-        del GLOBAL_RARE_VALUE_STORAGE[to_remove_val]
+    for key in keys_to_remove:
+        del global_storage[key]
+
+    # Update global variables
+    GLOBAL_RARE_VALUE_STORAGE = global_storage
+    IGNORED_VALUES = ignored_values
 
 
 def compute_cardinalities(input_dataframe: pd.DataFrame, pbar: Any, max_unique_hist_constraint: int) -> None:
-    """Compute cardinalities of features, incrementally"""
-
     global GLOBAL_CARDINALITY_STORAGE
+    global GLOBAL_COUNTS_STORAGE
+
     output_storage_card = defaultdict(set)
-    for enx, column in enumerate(input_dataframe):
-        output_storage_card[column] = set(input_dataframe[column].unique())
+    for enx, column in enumerate(input_dataframe.columns):
+        column_data = input_dataframe[column]
+        unique_values = set(column_data)
+        output_storage_card[column] = unique_values
+
         if column not in GLOBAL_CARDINALITY_STORAGE:
-            GLOBAL_CARDINALITY_STORAGE[column] = HyperLogLog(
-                HYPERLL_ERROR_BOUND,
-            )
+            GLOBAL_CARDINALITY_STORAGE[column] = HyperLogLog(HYPERLL_ERROR_BOUND)
 
         if column not in GLOBAL_COUNTS_STORAGE:
             GLOBAL_COUNTS_STORAGE[column] = PrimitiveConstrainedCounter(max_unique_hist_constraint)
 
-        [GLOBAL_COUNTS_STORAGE[column].add(value) for value in input_dataframe[column].values]
+        GLOBAL_COUNTS_STORAGE[column].batch_add(column_data.values.tolist())
 
-        for unique_value in set(input_dataframe[column].unique()):
+        for unique_value in unique_values:
             if unique_value:
-                GLOBAL_CARDINALITY_STORAGE[column].add(
-                    internal_hash(unique_value),
-                )
+                GLOBAL_CARDINALITY_STORAGE[column].add(internal_hash(unique_value))
 
-        pbar.set_description(
-            f'Computing cardinality (Hyperloglog update) {enx}/{input_dataframe.shape[1]}',
-        )
+        pbar.set_description(f'Computing cardinality (Hyperloglog update) {enx+1}/{input_dataframe.shape[1]}')
 
 
 def compute_bounds_increment(
     input_dataframe: pd.DataFrame, numeric_column_types: set[str],
 ) -> dict[str, Any]:
-    all_features = input_dataframe.columns
     numeric_column_types = set(numeric_column_types)
     summary_object = {}
-    summary_storage: Any = {}
-    for feature in all_features:
-        if feature in numeric_column_types:
-            feature_vector = pd.to_numeric(
-                input_dataframe[feature], errors='coerce',
-            )
-            minimum = np.min(feature_vector)
-            maximum = np.max(feature_vector)
-            mean = np.mean(feature_vector)
-            summary_storage = NumericFeatureSummary(
-                feature, minimum, maximum, mean, len(
-                    np.unique(feature_vector),
-                ),
-            )
-            summary_object[feature] = summary_storage
 
-        else:
-            feature_vector = input_dataframe[feature].values
-            summary_storage = NominalFeatureSummary(
-                feature, len(np.unique(feature_vector)),
+    for feature in input_dataframe.columns:
+        feature_vector = input_dataframe[feature]
+        if feature in numeric_column_types:
+            feature_vector = pd.to_numeric(feature_vector, errors='coerce')
+            summary_object[feature] = NumericFeatureSummary(
+                feature,
+                np.min(feature_vector),
+                np.max(feature_vector),
+                np.mean(feature_vector),
+                len(np.unique(feature_vector)),
             )
-            summary_object[feature] = summary_storage
+        else:
+            summary_object[feature] = NominalFeatureSummary(
+                feature,
+                len(np.unique(feature_vector)),
+            )
 
     return summary_object
 
@@ -506,19 +519,18 @@ def compute_batch_ranking(
     column_descriptions: list[str],
     logger: Any,
     pbar: Any,
-) -> tuple[BatchRankingSummary, dict[str, Any], dict[str, set[str]], dict[str, set[str]]]:
+) -> tuple[
+    BatchRankingSummary, dict[str, Any], dict[str, set[str]], dict[str, set[str]],
+]:
     """Enrich the feature space and compute the batch importances"""
 
-    input_dataframe = pd.DataFrame(line_tmp_storage)
-    input_dataframe.columns = column_descriptions
+    input_dataframe = pd.DataFrame(line_tmp_storage, columns=column_descriptions)
     pbar.set_description('Control features')
 
     if args.feature_set_focus:
+        focus_set = set()
         if args.feature_set_focus == '_all_from_reference_JSON':
-            focus_set = extract_features_from_reference_JSON(
-                args.reference_model_JSON,
-            )
-
+            focus_set = extract_features_from_reference_JSON(args.reference_model_JSON)
         else:
             focus_set = set(args.feature_set_focus.split(','))
 
@@ -527,7 +539,6 @@ def compute_batch_ranking(
         input_dataframe = input_dataframe[list(focus_set)]
 
     if args.transformers != 'none':
-
         pbar.set_description('Adding transformations')
         input_dataframe = enrich_with_transformations(
             input_dataframe, numeric_column_types, logger, args,
@@ -541,21 +552,14 @@ def compute_batch_ranking(
 
     if args.subfeature_mapping != 'False':
         pbar.set_description('Constructing new (sub)features')
-        input_dataframe = compute_subfeatures(
-            input_dataframe, logger, args, pbar,
-        )
+        input_dataframe = compute_subfeatures(input_dataframe, logger, args, pbar)
 
     if args.interaction_order > 1 or args.reference_model_JSON:
         pbar.set_description('Constructing new features')
-        input_dataframe = compute_combined_features(
-            input_dataframe, args, pbar,
-        )
+        input_dataframe = compute_combined_features(input_dataframe, args, pbar)
 
-    # in case of 3mr we compute the score of combinations against the target
     if '3mr' in args.heuristic:
-        pbar.set_description(
-            'Constructing features for computing relations in 3mr',
-        )
+        pbar.set_description('Constructing features for computing relations in 3mr')
         input_dataframe = compute_combined_features(
             input_dataframe, args, pbar, True,
         )
@@ -564,7 +568,6 @@ def compute_batch_ranking(
         pbar.set_description('Computing baseline features')
         input_dataframe = include_noisy_features(input_dataframe, logger, args)
 
-    # Compute incremental statistic useful for data inspection/transformer generation
     pbar.set_description('Computing coverage')
     coverage_storage = compute_coverage(input_dataframe, args)
     feature_memory_consumption = compute_feature_memory_consumption(
@@ -575,9 +578,7 @@ def compute_batch_ranking(
     if args.task == 'identify_rare_values':
         compute_value_counts(input_dataframe, args)
 
-    bounds_storage = compute_bounds_increment(
-        input_dataframe, numeric_column_types,
-    )
+    bounds_storage = compute_bounds_increment(input_dataframe, numeric_column_types)
 
     pbar.set_description(
         f'Computing ranks for {input_dataframe.shape[1]} features',
@@ -592,15 +593,21 @@ def compute_batch_ranking(
 
 
 def get_grouped_df(importances_df_list: list[tuple[str, str, float]]) -> pd.DataFrame:
-    """A helper method that enables median-based aggregation after processing"""
+    """Median-based aggregation of per-batch importance triplets.
 
-    importances_df = pd.DataFrame(importances_df_list)
-    if len(importances_df) == 0:
+    Note: median aggregation across minibatches is NOT the same as computing
+    MI on the pooled data. For features whose score distribution across
+    batches is long-tailed (e.g., a feature is informative in some data
+    segments but not others), median introduces a downward bias compared
+    to a single full-data MI estimate. This is a deliberate robustness
+    trade-off — median is resistant to outlier batches.
+    """
+
+    importances_df = pd.DataFrame(importances_df_list, columns=['FeatureA', 'FeatureB', 'Score'])
+    if importances_df.empty:
         return None
-    importances_df.columns = ['FeatureA', 'FeatureB', 'Score']
-    grouped = importances_df.groupby(
-        ['FeatureA', 'FeatureB'],
-    ).median().reset_index()
+    grouped = importances_df.groupby(['FeatureA', 'FeatureB'], as_index=False).median()
+
     return grouped
 
 
@@ -640,6 +647,8 @@ def estimate_importances_minibatches(
     bounds_storage_batch = []
     memory_storage_batch = []
     step_timing_checkpoints = []
+    last_jmi_ranking = None
+    last_interaction_info = None
 
     local_coverage_object = defaultdict(list)
     local_pbar = tqdm.tqdm(
@@ -650,7 +659,8 @@ def estimate_importances_minibatches(
 
     if file_extension == '.gz':
         file_stream = gzip.open(input_file, 'rt', encoding=data_encoding)
-
+    elif file_extension == '.zst':
+        file_stream = zstd.open(input_file, 'rt', encoding=data_encoding)
     else:
         file_stream = open(input_file, encoding=data_encoding)
 
@@ -699,6 +709,11 @@ def estimate_importances_minibatches(
             step_timing_checkpoints.append(importances_batch.step_times)
             importances_df += importances_batch.triplet_scores
 
+            if importances_batch.jmi_ranking is not None:
+                last_jmi_ranking = importances_batch.jmi_ranking
+            if importances_batch.interaction_info is not None:
+                last_interaction_info = importances_batch.interaction_info
+
             if args.heuristic != 'Constant':
                 local_pbar.set_description('Creating checkpoint')
                 checkpoint_importances_df(importances_df)
@@ -741,17 +756,24 @@ def estimate_importances_minibatches(
         bounds_storage_batch.append(bounds_storage)
         checkpoint_importances_df(importances_df)
 
+        if importances_batch.jmi_ranking is not None:
+            last_jmi_ranking = importances_batch.jmi_ranking
+        if importances_batch.interaction_info is not None:
+            last_interaction_info = importances_batch.interaction_info
+
     local_pbar.set_description('Wrapping up')
     local_pbar.close()
 
-    return (
-        step_timing_checkpoints,
-        get_grouped_df(importances_df),
-        GLOBAL_CARDINALITY_STORAGE.copy(),
-        bounds_storage_batch,
-        memory_storage_batch,
-        local_coverage_object,
-        GLOBAL_RARE_VALUE_STORAGE.copy(),
-        GLOBAL_PRIOR_COMB_COUNTS.copy(),
-        GLOBAL_COUNTS_STORAGE.copy(),
+    return MinibatchResult(
+        step_timing_checkpoints=step_timing_checkpoints,
+        mutual_information_estimates=get_grouped_df(importances_df),
+        cardinality_object=GLOBAL_CARDINALITY_STORAGE.copy(),
+        bounds_object_storage=bounds_storage_batch,
+        memory_object_storage=memory_storage_batch,
+        coverage_object=local_coverage_object,
+        rare_value_storage=GLOBAL_RARE_VALUE_STORAGE.copy(),
+        prior_comb_counts=GLOBAL_PRIOR_COMB_COUNTS.copy(),
+        item_counts=GLOBAL_COUNTS_STORAGE.copy(),
+        jmi_ranking=last_jmi_ranking,
+        interaction_info=last_interaction_info,
     )

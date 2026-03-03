@@ -5,8 +5,8 @@ import unittest
 
 import numpy as np
 
-from outrank.algorithms.feature_ranking.ranking_mi_numba import \
-    mutual_info_estimator_numba
+from outrank.algorithms.feature_ranking.ranking_mi_numba_opt import \
+    mutual_info_estimator_numba_opt
 
 np.random.seed(123)
 sys.path.append('./outrank')
@@ -16,32 +16,32 @@ class CompareStrategiesTest(unittest.TestCase):
     def test_mi_numba(self):
         a = np.random.random(10**6).reshape(-1).astype(np.int32)
         b = np.random.random(10**6).reshape(-1).astype(np.int32)
-        final_score = mutual_info_estimator_numba(a, b, np.float32(1.0), False)
+        final_score = mutual_info_estimator_numba_opt(a, b, np.float32(1.0), False)
         self.assertEqual(final_score, 0.0)
 
     def test_mi_numba_random(self):
         a = np.array([1, 0, 0, 0, 1, 1, 1, 0], dtype=np.int32)
         b = np.random.random(8).reshape(-1).astype(np.int32)
 
-        final_score = mutual_info_estimator_numba(a, b, np.float32(1.0), False)
+        final_score = mutual_info_estimator_numba_opt(a, b, np.float32(1.0), False)
         # b is all zeros (random floats in [0,1) truncate to 0), so MI should be ~0
         self.assertLessEqual(final_score, 0.0)
 
     def test_mi_numba_mirror(self):
         a = np.array([1, 0, 0, 0, 1, 1, 1, 0], dtype=np.int32)
         b = np.array([1, 0, 0, 0, 1, 1, 1, 0], dtype=np.int32)
-        final_score = mutual_info_estimator_numba(a, b, np.float32(1.0), False)
+        final_score = mutual_info_estimator_numba_opt(a, b, np.float32(1.0), False)
         self.assertGreater(final_score, 0.60)
 
     def test_mi_numba_longer_inputs(self):
         b = np.array([1, 0, 0, 0, 1, 1, 1, 0] * 10**5, dtype=np.int32)
-        final_score = mutual_info_estimator_numba(b, b, np.float32(1.0), False)
+        final_score = mutual_info_estimator_numba_opt(b, b, np.float32(1.0), False)
         self.assertGreater(final_score, 0.60)
 
     def test_mi_numba_permutation(self):
         a = np.array([1, 0, 0, 0, 1, 1, 1, 0] * 10**3, dtype=np.int32)
         b = np.array(np.random.permutation(a), dtype=np.int32)
-        final_score = mutual_info_estimator_numba(a, b, np.float32(1.0), False)
+        final_score = mutual_info_estimator_numba_opt(a, b, np.float32(1.0), False)
         self.assertLess(final_score, 0.05)
 
     def test_mi_numba_interaction(self):
@@ -51,13 +51,13 @@ class CompareStrategiesTest(unittest.TestCase):
         medium = np.array([1, 1, 0, 0, 1, 1, 1, 1], dtype=np.int32)
         high = np.array([1, 0, 0, 0, 1, 1, 1, 1], dtype=np.int32)
 
-        lowest_score = mutual_info_estimator_numba(
+        lowest_score = mutual_info_estimator_numba_opt(
             a, lowest, np.float32(1.0), False,
         )
-        medium_score = mutual_info_estimator_numba(
+        medium_score = mutual_info_estimator_numba_opt(
             a, medium, np.float32(1.0), False,
         )
-        high_score = mutual_info_estimator_numba(
+        high_score = mutual_info_estimator_numba_opt(
             a, high, np.float32(1.0), False,
         )
 
@@ -73,11 +73,11 @@ class CompareStrategiesTest(unittest.TestCase):
             vector_first, vector_second,
         ).astype(np.int32)
 
-        score_independent_first = mutual_info_estimator_numba(
+        score_independent_first = mutual_info_estimator_numba_opt(
             vector_first, vector_third, np.float32(1.0), False,
         )
 
-        score_independent_second = mutual_info_estimator_numba(
+        score_independent_second = mutual_info_estimator_numba_opt(
             vector_second, vector_third, np.float32(1.0), False,
         )
 
@@ -90,7 +90,7 @@ class CompareStrategiesTest(unittest.TestCase):
             list(hash(x) for x in zip(vector_first, vector_second)),
         ).astype(np.int32)
 
-        score_combined = mutual_info_estimator_numba(
+        score_combined = mutual_info_estimator_numba_opt(
             combined_feature, vector_third, np.float32(1.0), False,
         )
 
@@ -106,7 +106,7 @@ class CompareStrategiesTest(unittest.TestCase):
 
         # Should handle empty arrays gracefully
         with self.assertRaises((IndexError, ValueError)):
-            mutual_info_estimator_numba(a, b, np.float32(1.0), False)
+            mutual_info_estimator_numba_opt(a, b, np.float32(1.0), False)
 
     def test_single_element_arrays(self):
         """Test arrays with single elements"""
@@ -114,7 +114,7 @@ class CompareStrategiesTest(unittest.TestCase):
         b = np.array([0], dtype=np.int32)
 
         # Single element arrays should work
-        result = mutual_info_estimator_numba(a, b, np.float32(1.0), False)
+        result = mutual_info_estimator_numba_opt(a, b, np.float32(1.0), False)
         self.assertIsInstance(result, (float, np.float32))
 
     def test_identical_arrays(self):
@@ -122,7 +122,7 @@ class CompareStrategiesTest(unittest.TestCase):
         a = np.array([1, 2, 3, 1, 2, 3] * 100, dtype=np.int32)
         b = a.copy()
 
-        result = mutual_info_estimator_numba(a, b, np.float32(1.0), False)
+        result = mutual_info_estimator_numba_opt(a, b, np.float32(1.0), False)
         # Identical arrays should have high mutual information
         self.assertGreater(result, 0.5)
 
@@ -133,7 +133,7 @@ class CompareStrategiesTest(unittest.TestCase):
 
         # Test various approximation factors
         for factor in [0.1, 0.5, 1.0]:
-            result = mutual_info_estimator_numba(a, b, np.float32(factor), False)
+            result = mutual_info_estimator_numba_opt(a, b, np.float32(factor), False)
             self.assertIsInstance(result, (float, np.float32))
 
     def test_approximation_factor_edge_cases(self):
@@ -142,11 +142,11 @@ class CompareStrategiesTest(unittest.TestCase):
         b = np.array([0, 1, 0, 1] * 100, dtype=np.int32)
 
         # Very small approximation factor
-        result = mutual_info_estimator_numba(a, b, np.float32(0.01), False)
+        result = mutual_info_estimator_numba_opt(a, b, np.float32(0.01), False)
         self.assertIsInstance(result, (float, np.float32))
 
         # Approximation factor > 1 (should still work)
-        result = mutual_info_estimator_numba(a, b, np.float32(1.5), False)
+        result = mutual_info_estimator_numba_opt(a, b, np.float32(1.5), False)
         self.assertIsInstance(result, (float, np.float32))
 
     def test_cardinality_correction(self):
@@ -155,10 +155,10 @@ class CompareStrategiesTest(unittest.TestCase):
         b = np.array([1, 0, 1, 0, 1, 0] * 500, dtype=np.int32)
 
         # Without cardinality correction
-        result_no_corr = mutual_info_estimator_numba(a, b, np.float32(1.0), False)
+        result_no_corr = mutual_info_estimator_numba_opt(a, b, np.float32(1.0), False)
 
         # With cardinality correction
-        result_with_corr = mutual_info_estimator_numba(a, b, np.float32(1.0), True)
+        result_with_corr = mutual_info_estimator_numba_opt(a, b, np.float32(1.0), True)
 
         # Both should be valid but may differ
         self.assertIsInstance(result_no_corr, (float, np.float32))
@@ -170,7 +170,7 @@ class CompareStrategiesTest(unittest.TestCase):
         b = np.array([0, 1], dtype=np.int32)
 
         with self.assertRaises((IndexError, ValueError)):
-            mutual_info_estimator_numba(a, b, np.float32(1.0), False)
+            mutual_info_estimator_numba_opt(a, b, np.float32(1.0), False)
 
     def test_binary_vs_multiclass(self):
         """Test binary vs multiclass scenarios"""
@@ -178,13 +178,13 @@ class CompareStrategiesTest(unittest.TestCase):
         a_binary = np.array([0, 1] * 500, dtype=np.int32)
         b_binary = np.array([1, 0] * 500, dtype=np.int32)
 
-        result_binary = mutual_info_estimator_numba(a_binary, b_binary, np.float32(1.0), False)
+        result_binary = mutual_info_estimator_numba_opt(a_binary, b_binary, np.float32(1.0), False)
 
         # Multiclass case
         a_multi = np.array([0, 1, 2] * 333 + [0], dtype=np.int32)
         b_multi = np.array([2, 0, 1] * 333 + [1], dtype=np.int32)
 
-        result_multi = mutual_info_estimator_numba(a_multi, b_multi, np.float32(1.0), False)
+        result_multi = mutual_info_estimator_numba_opt(a_multi, b_multi, np.float32(1.0), False)
 
         # Both should be valid
         self.assertIsInstance(result_binary, (float, np.float32))
@@ -193,14 +193,15 @@ class CompareStrategiesTest(unittest.TestCase):
     def test_extreme_values(self):
         """Test with large integer values near the algorithm's operational limits.
 
-        numba_unique uses counting-sort (allocates max(a)+1 cells), so
-        INT32_MAX is not feasible.  Use a large-but-allocatable value instead.
+        The opt fast-path builds a contingency table of size dx*dy, and
+        numba_unique uses counting-sort (max+1 cells).  INT32_MAX would
+        overflow the dimension arithmetic, so use a feasible large value.
         """
         max_val = 100_000
         a = np.array([0, max_val] * 100, dtype=np.int32)
         b = np.array([max_val, 0] * 100, dtype=np.int32)
 
-        result = mutual_info_estimator_numba(a, b, np.float32(1.0), False)
+        result = mutual_info_estimator_numba_opt(a, b, np.float32(1.0), False)
         self.assertIsInstance(result, (float, np.float32))
 
     def test_all_same_values(self):
@@ -208,7 +209,7 @@ class CompareStrategiesTest(unittest.TestCase):
         a = np.array([5] * 1000, dtype=np.int32)
         b = np.array([5] * 1000, dtype=np.int32)
 
-        result = mutual_info_estimator_numba(a, b, np.float32(1.0), False)
+        result = mutual_info_estimator_numba_opt(a, b, np.float32(1.0), False)
         # Should handle constant arrays
         self.assertIsInstance(result, (float, np.float32))
 
@@ -218,7 +219,7 @@ class CompareStrategiesTest(unittest.TestCase):
         a = np.random.randint(0, 10, size=size, dtype=np.int32)
         b = np.random.randint(0, 10, size=size, dtype=np.int32)
 
-        result = mutual_info_estimator_numba(a, b, np.float32(0.1), True)
+        result = mutual_info_estimator_numba_opt(a, b, np.float32(0.1), True)
         self.assertIsInstance(result, (float, np.float32))
 
     def test_deterministic_behavior(self):
@@ -227,9 +228,9 @@ class CompareStrategiesTest(unittest.TestCase):
         b = np.array([0, 1, 0, 1, 0] * 200, dtype=np.int32)
 
         # Multiple runs should give same result
-        result1 = mutual_info_estimator_numba(a, b, np.float32(1.0), False)
-        result2 = mutual_info_estimator_numba(a, b, np.float32(1.0), False)
-        result3 = mutual_info_estimator_numba(a, b, np.float32(1.0), False)
+        result1 = mutual_info_estimator_numba_opt(a, b, np.float32(1.0), False)
+        result2 = mutual_info_estimator_numba_opt(a, b, np.float32(1.0), False)
+        result3 = mutual_info_estimator_numba_opt(a, b, np.float32(1.0), False)
 
         self.assertEqual(result1, result2)
         self.assertEqual(result2, result3)
@@ -242,7 +243,7 @@ class CompareStrategiesTest(unittest.TestCase):
         a = np.random.randint(0, 3, size=5000, dtype=np.int32)
         b = np.random.randint(0, 3, size=5000, dtype=np.int32)
 
-        result = mutual_info_estimator_numba(a, b, np.float32(1.0), False)
+        result = mutual_info_estimator_numba_opt(a, b, np.float32(1.0), False)
 
         # Independent variables should have low mutual information
         # Note: Due to finite sample effects, may not be exactly 0
@@ -254,7 +255,7 @@ class CompareStrategiesTest(unittest.TestCase):
         a = np.array([0, 1, 2] * 1000, dtype=np.int32)
         b = np.array([0, 2, 4] * 1000, dtype=np.int32)  # b = 2*a
 
-        result = mutual_info_estimator_numba(a, b, np.float32(1.0), False)
+        result = mutual_info_estimator_numba_opt(a, b, np.float32(1.0), False)
 
         # Functional relationship should have high mutual information
         self.assertGreater(result, 0.5)
@@ -272,8 +273,8 @@ class CompareStrategiesTest(unittest.TestCase):
         b_noisy = b_clean.copy()
         b_noisy[noise_indices] = 1 - b_noisy[noise_indices]
 
-        result_clean = mutual_info_estimator_numba(a, b_clean, np.float32(1.0), False)
-        result_noisy = mutual_info_estimator_numba(a, b_noisy, np.float32(1.0), False)
+        result_clean = mutual_info_estimator_numba_opt(a, b_clean, np.float32(1.0), False)
+        result_noisy = mutual_info_estimator_numba_opt(a, b_noisy, np.float32(1.0), False)
 
         # Noisy version should have lower MI than clean version
         self.assertLess(result_noisy, result_clean)

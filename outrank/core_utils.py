@@ -9,12 +9,6 @@ from collections import Counter
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any
-from typing import Dict
-from typing import List
-from typing import Optional
-from typing import Set
-from typing import Tuple
-from typing import Union
 
 import numpy as np
 import pandas as pd
@@ -23,22 +17,22 @@ import xxhash
 logging.basicConfig(format='%(asctime)s %(message)s', level=logging.INFO)
 
 pro_tips = [
-    'OutRank can construct subfeatures; features based on subspaces. Example command argument is: --subfeature_mapping "feature_a->feature_b;feature_c<->feature_d;feature_c<->feature_e"',
-    'Heuristic MI-numba-randomized seems like the best of both worlds! (speed + performance).',
-    'Heuristic surrogate-lr performs cross-validation (internally), keep that in mind!',
-    'Consider running OutRank on a smaller data sample first, might be enough (--subsampling = a lot).',
-    'There are two types of combinations supported; unsupervised pairwise ranking (redundancies- --target_ranking_only=False), and supervised combinations - (--interaction_order > 1)',
-    'Visualization part also includes clustering - this might be very insightful!',
-    'By default OutRank includes feature cardinality and coverage in feature names (card; cov)',
-    'Intermediary checkpoints (tmp_checkpoint.tsv) might already give you insights during longer runs.',
-    'In theory, you can rank redundancies of combined features (--interaction_order AND --target_ranking_only=False).',
-    'Give it as many threads as physically possible (--num_threads).',
-    'You can speed up ranking by diminishing feature buffer size (--combination_number_upper_bound determines how many ranking computations per batch will be considered). This, and --subsampling are very powerful together.',
-    'Want to rank feature transformations, but not sure which ones to choose? --transformers=default should serve as a solid baseline (common DS transformations included).',
-    'Your target can be any feature! (explaining one feature with others)',
-    'OutRank uses HyperLogLog for cardinality estimation - this is also a potential usecase (understanding cardinalities across different data sets).',
+    'OutRank can construct subfeatures based on subspaces. Use: --subfeature_mapping "feature_a->feature_b;feature_c<->feature_d;feature_c<->feature_e".',
+    'Heuristic MI-numba-randomized offers a great balance of speed and performance.',
+    'Heuristic surrogate-lr performs internal cross-validation; keep that in mind.',
+    'Consider running OutRank on a smaller sample first; it might be sufficient (--subsampling = a lot).',
+    'OutRank supports two types of combinations: unsupervised pairwise ranking (--target_ranking_only=False) and supervised combinations (--interaction_order > 1).',
+    'The visualization includes clustering, which can be very insightful!',
+    'By default, OutRank includes feature cardinality and coverage in feature names (e.g., card; cov).',
+    'Intermediary checkpoints (tmp_checkpoint.tsv) can provide insights during longer runs.',
+    'You can rank redundancies of combined features using --interaction_order and --target_ranking_only=False.',
+    'Use as many threads as possible for better performance (--num_threads).',
+    'Speed up ranking by reducing the feature buffer size (--combination_number_upper_bound) and using --subsampling together.',
+    'Not sure which feature transformations to choose? Use --transformers=default for a solid baseline (includes common DS transformations).',
+    'Your target can be any feature, allowing you to explain one feature with others.',
+    'OutRank uses HyperLogLog for cardinality estimation, useful for understanding cardinalities across datasets.',
     'Each feature is named as featureName(cardinality, coverage in percents) in the final files.',
-    'You can generate candidate feature transformation ranges (fw) by using --task=feature_summary_transformers.',
+    'Generate candidate feature transformation ranges using --task=feature_summary_transformers.',
 ]
 
 
@@ -91,6 +85,29 @@ class BatchRankingSummary:
 
     triplet_scores: list[tuple[str, str, float]]
     step_times: dict[str, Any]
+    jmi_ranking: Any = None
+    interaction_info: Any = None
+
+
+@dataclass
+class MinibatchResult:
+    """Structured return type for estimate_importances_minibatches.
+
+    Replaces the 11-element positional tuple to make the return contract
+    explicit and reduce indexing errors at the call site.
+    """
+
+    step_timing_checkpoints: list[dict[str, Any]]
+    mutual_information_estimates: Any  # pd.DataFrame | None
+    cardinality_object: dict[Any, Any]
+    bounds_object_storage: list[dict[str, Any]]
+    memory_object_storage: list[dict[str, Any]]
+    coverage_object: Any  # defaultdict[str, list]
+    rare_value_storage: dict[str, Any]
+    prior_comb_counts: dict[Any, int]
+    item_counts: dict[str, Any]
+    jmi_ranking: Any = None  # pd.DataFrame | None
+    interaction_info: Any = None  # pd.DataFrame | None
 
 
 def display_random_tip() -> None:
@@ -199,7 +216,7 @@ def parse_ob_line_vw(
     ]
     if not include_namespace_info:
         the_real_instance = [
-            x[2:] if not x is None else None for x in the_real_instance
+            x[2:] if x is not None else None for x in the_real_instance
         ]
 
     parts = [label] + the_real_instance
@@ -268,7 +285,7 @@ def parse_namespace(namespace_path: str) -> tuple[set[str], dict[str, str]]:
                 id_feature_map[fw_id] = feature
                 if type_name == 'f32':
                     float_set.add(feature)
-            except Exception as es:
+            except Exception:
                 pass
 
     return float_set, id_feature_map
@@ -282,6 +299,19 @@ def read_column_names(mapping_file: str) -> list[str]:
     return columns
 
 
+def identify_data_file_type(data_path):
+
+    all_files  = set(list(glob.glob(os.path.join(data_path, '*'))))
+    gz_pname, zst_pname = 'data.vw.gz', 'data.vw.zst'
+    if gz_pname in ''.join(all_files):
+        return os.path.join(data_path, gz_pname)
+    elif zst_pname in ''.join(all_files):
+        return os.path.join(data_path, zst_pname)
+    else:
+        raise NotImplementedError('Please provide a valid data type .. (gz, zst)')
+
+
+
 def parse_ob_vw_feature_information(data_path) -> DatasetInformationStorage:
     """A generic parser of ob-based data"""
 
@@ -292,7 +322,7 @@ def parse_ob_vw_feature_information(data_path) -> DatasetInformationStorage:
     # We establish column order here
     column_names = ['label'] + list(fw_map.values())
 
-    data_path = os.path.join(data_path, 'data.vw.gz')
+    data_path = identify_data_file_type(data_path)
     col_delimiter = None
     encoding = 'utf-8'
 
@@ -386,7 +416,7 @@ def parse_csv_raw(data_path) -> DatasetInformationStorage:
     with open(data_path) as inp_data:
         header = inp_data.readline()
     col_delimiter = ','
-    column_names = header.strip().split(col_delimiter)
+    column_names = list(csv.reader([header.strip()]))[0]
     encoding = 'latin1'
     return DatasetInformationStorage(
         data_path, column_names, column_types, col_delimiter, encoding, None,
@@ -647,7 +677,7 @@ def summarize_rare_counts(
 
 
 def is_prior_heuristic(args: Any) -> bool:
-    if '-prior' in args.heuristic and args.reference_model_JSON:
+    if args.heuristic in {'surrogate-SGD', 'surrogate-SVM', 'surrogate-SGD-RP'} and args.reference_model_JSON:
         return True
     return False
 
